@@ -21,20 +21,36 @@ set -eoux pipefail
 
 TMP="/tmp/e2e/${PLATFORM}"
 mkdir -p "${TMP}"
+cp ~/.kube/config "${TMP}/kubeconfig"
+
+# Env vars for cloud accounts
+set +x
+export GCP_B64ENCODED_CREDENTIALS=$( cat $(pwd)/.secrets/gcp-credentials-cluster-api.json | base64 | tr -d '\n' )
+set -x
 
 # Talos
 
 export TALOSCONFIG="${TMP}/talosconfig"
 export TALOS_VERSION=v1.0.6
+export KUBECONFIG="${TMP}/kubeconfig"
+export KUBECTL="kubectl"
+export TALOSCTL="talosctl"
+export CILIUM_VERSION="1.11.5"
+
+export CLUSTER_NAME="cluster-00"
+export GITHUB_USER="maheshrayas"
+export GITHUB_REPO="hackathon-2022"
+export GITHUB_BRANCH="master"
+export CLI_ARGS=""
 
 # Kubernetes
 
-export KUBECONFIG="${TMP}/kubeconfig"
-export KUBERNETES_VERSION=${KUBERNETES_VERSION:-1.24.1}
+export KUBERNETES_VERSION=${KUBERNETES_VERSION:-1.23.7}
 
-export NAME_PREFIX="cluster-01"
+export NAME_PREFIX="cluster-00"
 export TIMEOUT=1200
 export NUM_NODES=2
+export TEMPLATE_TYPE=test
 
 # default values, overridden by talosctl cluster create tests
 PROVISIONER=
@@ -44,39 +60,39 @@ CLUSTER_NAME=
 function create_cluster_capi {
   # Wait for first controlplane machine to have a name
   timeout=$(($(date +%s) + ${TIMEOUT}))
-  until [ -n "$(${KUBECTL} --kubeconfig /tmp/e2e/kubeconfig get machine -l cluster.x-k8s.io/control-plane,cluster.x-k8s.io/cluster-name=${NAME_PREFIX} --all-namespaces -o json | jq -re '.items[0].metadata.name | select (.!=null)')" ]; do
+  until [ -n "$(${KUBECTL} --kubeconfig ${KUBECONFIG} get machine -l cluster.x-k8s.io/control-plane,cluster.x-k8s.io/cluster-name=${NAME_PREFIX} --all-namespaces -o json | jq -re '.items[0].metadata.name | select (.!=null)')" ]; do
     [[ $(date +%s) -gt $timeout ]] && exit 1
     sleep 10
-    ${KUBECTL} --kubeconfig /tmp/e2e/kubeconfig get machine -l cluster.x-k8s.io/control-plane,cluster.x-k8s.io/cluster-name=${NAME_PREFIX} --all-namespaces
+    ${KUBECTL} --kubeconfig ${KUBECONFIG} get machine -l cluster.x-k8s.io/control-plane,cluster.x-k8s.io/cluster-name=${NAME_PREFIX} --all-namespaces
   done
 
-  FIRST_CP_NODE=$(${KUBECTL} --kubeconfig /tmp/e2e/kubeconfig get machine -l cluster.x-k8s.io/control-plane,cluster.x-k8s.io/cluster-name=${NAME_PREFIX} --all-namespaces -o json | jq -r '.items[0].metadata.name')
+  FIRST_CP_NODE=$(${KUBECTL} --kubeconfig ${KUBECONFIG} get machine -l cluster.x-k8s.io/control-plane,cluster.x-k8s.io/cluster-name=${NAME_PREFIX} --all-namespaces -o json | jq -r '.items[0].metadata.name')
 
   # Wait for first controlplane machine to have a talosconfig ref
   timeout=$(($(date +%s) + ${TIMEOUT}))
-  until [ -n "$(${KUBECTL} --kubeconfig /tmp/e2e/kubeconfig get machine ${FIRST_CP_NODE} -o json | jq -re '.spec.bootstrap.configRef.name | select (.!=null)')" ]; do
+  until [ -n "$(${KUBECTL} --kubeconfig ${KUBECONFIG} get machine ${FIRST_CP_NODE} -o json | jq -re '.spec.bootstrap.configRef.name | select (.!=null)')" ]; do
     [[ $(date +%s) -gt $timeout ]] && exit 1
     sleep 10
   done
 
-  FIRST_CP_TALOSCONFIG=$(${KUBECTL} --kubeconfig /tmp/e2e/kubeconfig get machine ${FIRST_CP_NODE} -o json | jq -re '.spec.bootstrap.configRef.name')
+  FIRST_CP_TALOSCONFIG=$(${KUBECTL} --kubeconfig ${KUBECONFIG} get machine ${FIRST_CP_NODE} -o json | jq -re '.spec.bootstrap.configRef.name')
 
   # Wait for talosconfig in cm then dump it out
   timeout=$(($(date +%s) + ${TIMEOUT}))
-  until [ -n "$(${KUBECTL} --kubeconfig /tmp/e2e/kubeconfig get talosconfig ${FIRST_CP_TALOSCONFIG} -o jsonpath='{.status.talosConfig}')" ]; do
+  until [ -n "$(${KUBECTL} --kubeconfig ${KUBECONFIG} get talosconfig ${FIRST_CP_TALOSCONFIG} -o jsonpath='{.status.talosConfig}')" ]; do
     [[ $(date +%s) -gt $timeout ]] && exit 1
     sleep 10
   done
-  ${KUBECTL} --kubeconfig /tmp/e2e/kubeconfig get talosconfig ${FIRST_CP_TALOSCONFIG} -o jsonpath='{.status.talosConfig}' > ${TALOSCONFIG}
+  ${KUBECTL} --kubeconfig ${KUBECONFIG} get talosconfig ${FIRST_CP_TALOSCONFIG} -o jsonpath='{.status.talosConfig}' > ${TALOSCONFIG}
 
   # Wait until we have an IP for first controlplane node
   timeout=$(($(date +%s) + ${TIMEOUT}))
-  until [ -n "$(${KUBECTL} --kubeconfig /tmp/e2e/kubeconfig get machine -o go-template --template='{{range .status.addresses}}{{if eq .type "ExternalIP"}}{{.address}}{{end}}{{end}}' ${FIRST_CP_NODE})" ]; do
+  until [ -n "$(${KUBECTL} --kubeconfig ${KUBECONFIG} get machine -o go-template --template='{{range .status.addresses}}{{if eq .type "ExternalIP"}}{{.address}}{{end}}{{end}}' ${FIRST_CP_NODE})" ]; do
     [[ $(date +%s) -gt $timeout ]] && exit 1
     sleep 10
   done
 
-  MASTER_IP=$(${KUBECTL} --kubeconfig /tmp/e2e/kubeconfig get machine -o go-template --template='{{range .status.addresses}}{{if eq .type "ExternalIP"}}{{.address}}{{end}}{{end}}' ${FIRST_CP_NODE})
+  MASTER_IP=$(${KUBECTL} --kubeconfig ${KUBECONFIG} get machine -o go-template --template='{{range .status.addresses}}{{if eq .type "ExternalIP"}}{{.address}}{{end}}{{end}}' ${FIRST_CP_NODE})
   "${TALOSCTL}" config endpoint "${MASTER_IP}"
   "${TALOSCTL}" config node "${MASTER_IP}"
 
@@ -88,72 +104,55 @@ function create_cluster_capi {
   done
 
   # Wait for nodes to check in
+
   timeout=$(($(date +%s) + ${TIMEOUT}))
-  until ${KUBECTL} get nodes -o go-template='{{ len .items }}' | grep ${NUM_NODES} >/dev/null; do
+  until ${KUBECTL} get nodes -o go-template='{{ len .items }}' --kubeconfig "${TMP}/kubeconfig-00" | grep ${NUM_NODES} >/dev/null; do
     [[ $(date +%s) -gt $timeout ]] && exit 1
-    ${KUBECTL} get nodes -o wide && :
+    ${KUBECTL} get nodes -o wide --kubeconfig "${TMP}/kubeconfig-00" && :
     sleep 10
   done
+
+  url=$(cat "${TMP}/kubeconfig-00" | yq '.clusters[].cluster.server')
+  foo=${url#"https://"}
+  foo=${foo%":443"}
+  echo "LB IP address : ${foo}"
+
+  mkdir -p "k8s/clusters/${CLUSTER_NAME}"
+  #clusterctl generate cluster "${CLUSTER_NAME}" --from templates/gcp/standard/template.yaml > "k8s/clusters/${CLUSTER_NAME}/cluster.yaml"
+  helm repo add cilium https://helm.cilium.io/ --force-update
+  helm template cilium cilium/cilium --version "${CILIUM_VERSION}" --namespace=kube-system --values=templates/gcp/${TEMPLATE_TYPE}/integrations/cilium/values.yaml --set k8sServiceHost=${foo} --dry-run > "k8s/clusters/${CLUSTER_NAME}/cni.yaml"
+  kubectl apply -f "k8s/clusters/${CLUSTER_NAME}/cni.yaml" --kubeconfig "${TMP}/kubeconfig-00"
 
   # Wait for nodes to be ready
   timeout=$(($(date +%s) + ${TIMEOUT}))
-  until ${KUBECTL} wait --timeout=1s --for=condition=ready=true --all nodes > /dev/null; do
+  until ${KUBECTL} wait --timeout=1s --for=condition=ready=true --all nodes --kubeconfig "${TMP}/kubeconfig-00" > /dev/null; do
     [[ $(date +%s) -gt $timeout ]] && exit 1
-    ${KUBECTL} get nodes -o wide && :
+    ${KUBECTL} get nodes -o wide --kubeconfig "${TMP}/kubeconfig-00" && :
     sleep 10
   done
+
+  flux bootstrap github \
+        --owner="${GITHUB_USER}" \
+        --repository="${GITHUB_REPO}" \
+        --path="k8s/clusters/${CLUSTER_NAME}" \
+        --branch="${GITHUB_BRANCH}" \
+        --network-policy=false \
+        --personal=true \
+        --private=false \
+        --kubeconfig="${TMP}/kubeconfig-00" \
+        "${CLI_ARGS}"
 
   # Verify that we have an HA controlplane
-  timeout=$(($(date +%s) + ${TIMEOUT}))
-  until ${KUBECTL} get nodes -l node-role.kubernetes.io/master='' -o go-template='{{ len .items }}' | grep 3 > /dev/null; do
-    [[ $(date +%s) -gt $timeout ]] && exit 1
-    ${KUBECTL} get nodes -l node-role.kubernetes.io/master='' && :
-    sleep 10
-  done
+  # timeout=$(($(date +%s) + ${TIMEOUT}))
+  # until ${KUBECTL} get nodes -l node-role.kubernetes.io/master='' -o go-template='{{ len .items }}' | grep 3 > /dev/null; do
+  #   [[ $(date +%s) -gt $timeout ]] && exit 1
+  #   ${KUBECTL} get nodes -l node-role.kubernetes.io/master='' && :
+  #   sleep 10
+  # done
 }
 
-function run_talos_integration_test {
-  case "${SHORT_INTEGRATION_TEST:-no}" in
-    yes|true|y)
-      TEST_SHORT="-test.short"
-      ;;
-    *)
-      TEST_SHORT=""
-      ;;
-    esac
-
-  case "${INTEGRATION_TEST_RUN:-no}" in
-    no)
-      TEST_RUN="-test.run ."
-      ;;
-    *)
-      TEST_RUN="-test.run ${INTEGRATION_TEST_RUN}"
-      ;;
-    esac
-
-  "${INTEGRATION_TEST}" -test.v -talos.failfast -talos.talosctlpath "${TALOSCTL}" -talos.kubectlpath "${KUBECTL}" -talos.provisioner "${PROVISIONER}" -talos.name "${CLUSTER_NAME}" ${TEST_RUN} ${TEST_SHORT}
-}
-
-function run_talos_integration_test_docker {
-  case "${SHORT_INTEGRATION_TEST:-no}" in
-    yes|true|y)
-      TEST_SHORT="-test.short"
-      ;;
-    *)
-      TEST_SHORT=""
-      ;;
-    esac
-
-  case "${INTEGRATION_TEST_RUN:-no}" in
-    no)
-      TEST_RUN="-test.run ."
-      ;;
-    *)
-      TEST_RUN="-test.run ${INTEGRATION_TEST_RUN}"
-      ;;
-    esac
-
-  "${INTEGRATION_TEST}" -test.v -talos.talosctlpath "${TALOSCTL}" -talos.kubectlpath "${KUBECTL}" -talos.k8sendpoint 127.0.0.1:6443 -talos.provisioner "${PROVISIONER}" -talos.name "${CLUSTER_NAME}" ${TEST_RUN} ${TEST_SHORT}
+function pivot_cluster_capi {
+  clusterctl move --to-kubeconfig="${TMP}/kubeconfig"
 }
 
 function run_kubernetes_conformance_test {
@@ -177,8 +176,7 @@ function run_worker_cis_benchmark {
 }
 
 function get_kubeconfig {
-  rm -f "${TMP}/kubeconfig"
-  "${TALOSCTL}" kubeconfig "${TMP}"
+  clusterctl get kubeconfig cluster-00 > "${TMP}/kubeconfig-00"
 }
 
 function dump_cluster_state {
@@ -188,55 +186,3 @@ function dump_cluster_state {
   ${KUBECTL} get pods --all-namespaces -o wide
 }
 
-function build_registry_mirrors {
-  if [[ "${CI:-false}" == "true" ]]; then
-    REGISTRY_MIRROR_FLAGS=
-
-    for registry in docker.io k8s.gcr.io quay.io gcr.io ghcr.io registry.dev.talos-systems.io; do
-      local service="registry-${registry//./-}.ci.svc"
-      local addr=`python3 -c "import socket; print(socket.gethostbyname('${service}'))"`
-
-      REGISTRY_MIRROR_FLAGS="${REGISTRY_MIRROR_FLAGS} --registry-mirror ${registry}=http://${addr}:5000"
-    done
-  else
-    # use the value from the environment, if present
-    REGISTRY_MIRROR_FLAGS=${REGISTRY_MIRROR_FLAGS:-}
-  fi
-}
-
-function run_extensions_test {
-  echo "Testing gVsisor..."
-  ${KUBECTL} apply -f ${PWD}/hack/gvisor/manifest.yaml
-  sleep 10
-  ${KUBECTL} wait --for=condition=ready pod nginx-gvisor --timeout=1m
-
-  echo "Testing firmware extension..."
-  ${TALOSCTL} ls -lr /lib/firmware | grep intel-ucode
-
-  echo "Testing extension service..."
-  curl http://172.20.1.2/ | grep Hello
-}
-
-function run_day_two_tests {
-  rm -rf "${TMP}/day-two-state"
-  # pulumi needs to be in $PATH temporarily
-  PATH="${PATH}:$(dirname ${PULUMI})" ${D2CTL} up --state-path "${TMP}/day-two-state" --config-path "${PWD}/hack/day-two/config.yaml"
-
-  ${KUBECTL} --namespace loki wait --timeout 900s --for=jsonpath='{.status.availableReplicas}=1' deployment/loki-kube-state-metrics
-  ${KUBECTL} --namespace loki wait --timeout 900s --for=jsonpath='{.status.availableReplicas}=1' deployment/loki-prometheus-server
-  ${KUBECTL} --namespace loki wait --timeout 900s --for=jsonpath='{.status.availableReplicas}=1' deployment/loki-grafana
-
-  ${KUBECTL} --namespace metallb wait --timeout 900s --for=jsonpath='{.status.availableReplicas}=1' deployment/metallb-controller
-
-  ${KUBECTL} --namespace ingress wait --timeout 900s --for=jsonpath='{.status.availableReplicas}=1' deployment/ingress-nginx-controller
-
-  # wait for the controller to populate the status field
-  sleep 10
-  ${KUBECTL} --namespace rook-ceph wait --timeout=1800s --for=jsonpath='{.status.phase}=Ready' cephclusters.ceph.rook.io/rook-ceph
-  ${KUBECTL} --namespace rook-ceph wait --timeout=1800s --for=jsonpath='{.status.state}=Created' cephclusters.ceph.rook.io/rook-ceph
-  # .status.ceph is populated only after the cluster comes up
-  sleep 20
-  ${KUBECTL} --namespace rook-ceph wait --timeout=1800s --for=jsonpath='{.status.ceph.health}=HEALTH_OK' cephclusters.ceph.rook.io/rook-ceph
-  # hack until https://github.com/kastenhq/kubestr/issues/101 is addressed
-  KUBERNETES_SERVICE_HOST= KUBECONFIG="${TMP}/kubeconfig" ${KUBESTR} fio --storageclass ceph-block --size 10G
-}
